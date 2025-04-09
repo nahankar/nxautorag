@@ -1,0 +1,324 @@
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+import os
+from typing import Dict, Any, Optional, List, Mapping
+from langchain.chains import RetrievalQA
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import HuggingFaceHub
+from langchain_openai import AzureOpenAI, ChatOpenAI
+import transformers
+from langchain.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+import torch
+from utils.vectorstore import get_embeddings
+import json
+from langchain.llms.base import LLM
+
+# Import global config from ingestion
+from api.ingestion import global_config, vectorstore as ingestion_vectorstore
+
+router = APIRouter()
+
+# Pydantic model for query request
+class QueryRequest(BaseModel):
+    question: str
+    include_sources: bool = False
+
+# Define HFWrapper class at module level
+class HFWrapper(LLM):
+    """Wrapper around HuggingFace pipeline to make it compatible with LangChain."""
+    
+    pipeline: Any
+    is_t5: bool = False
+    
+    @property
+    def _llm_type(self) -> str:
+        return "huggingface_pipeline"
+    
+    def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs) -> str:
+        """Call the HuggingFace pipeline with the prompt."""
+        if self.is_t5:
+            result = self.pipeline(prompt)[0]["generated_text"]
+            return result.strip()
+        else:
+            result = self.pipeline(prompt)[0]["generated_text"]
+            # Return only the newly generated text
+            return result[len(prompt):].strip()
+    
+    @property
+    def _identifying_params(self) -> Mapping[str, Any]:
+        """Get identifying parameters."""
+        return {"pipeline": str(self.pipeline), "is_t5": self.is_t5}
+
+# Initialize LLM based on global_config
+def get_llm():
+    # Read the latest config directly from file to ensure we have the most recent settings
+    latest_config = {}
+    try:
+        config_path = "./configs/latest.json"
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config_data = json.load(f)
+                if "llm_config" in config_data:
+                    llm_data = config_data["llm_config"]
+                    latest_config = {
+                        "provider": llm_data.get("llm_provider"),
+                        "model": llm_data.get("llm_model"),
+                        "token": llm_data.get("api_token"),
+                        "azure_endpoint": llm_data.get("azure_endpoint"),
+                        "azure_deployment": llm_data.get("azure_deployment"),
+                        "api_version": llm_data.get("api_version")
+                    }
+    except Exception as e:
+        print(f"Error loading latest config: {e}")
+    
+    # Use latest config if available, otherwise fall back to global_config
+    config_to_use = latest_config if latest_config else global_config
+    
+    provider = config_to_use.get("provider", "local")
+    model = config_to_use.get("model", "google/flan-t5-base")  # Changed default model to non-gated
+    token = config_to_use.get("token", "")
+    
+    # Clean up token (remove any spaces)
+    if token:
+        token = token.strip()
+    
+    print(f"Using LLM provider: {provider}, model: {model}")
+    
+    if provider == "local":
+        # Use transformers pipeline for local hosting
+        try:
+            # Check if CUDA is available
+            device = 0 if torch.cuda.is_available() else -1
+            
+            # Create HF pipeline
+            pipe = transformers.pipeline(
+                "text-generation",
+                model=model,
+                device=device,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                max_new_tokens=512
+            )
+            
+            # Create an instance of our LangChain-compatible wrapper
+            llm = HFWrapper(pipeline=pipe, is_t5="t5" in model.lower())
+            return llm
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error loading local model: {str(e)}")
+    
+    elif provider in ["hf_free", "hf_paid"]:
+        # Use HuggingFaceHub
+        try:
+            print(f"Using HuggingFace with token (first 4 chars): {token[:4] if token else 'None'}")
+            
+            # If no token provided or we're in a fallback situation, use local model
+            if not token or model == "mistralai/Mixtral-8x7B-Instruct-v0.1":  # Always use local for Mixtral which requires auth
+                print(f"Using local model fallback for {model}")
+                # Fall back to a simpler local model that doesn't require auth
+                fallback_model = "google/flan-t5-base"
+                print(f"Falling back to local model: {fallback_model}")
+                
+                # Check if CUDA is available
+                device = 0 if torch.cuda.is_available() else -1
+                
+                # Use text2text-generation for T5 models
+                pipe = transformers.pipeline(
+                    "text2text-generation",
+                    model=fallback_model,
+                    device=device,
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                    max_new_tokens=512
+                )
+                
+                # Create an instance of our LangChain-compatible wrapper
+                return HFWrapper(pipeline=pipe, is_t5=True)
+            
+            # If we have a token, try to use HuggingFaceHub
+            return HuggingFaceHub(
+                repo_id=model,
+                huggingfacehub_api_token=token,
+                model_kwargs={"temperature": 0.5, "max_length": 512}
+            )
+        except Exception as e:
+            print(f"Error loading HuggingFace model: {e}, falling back to local model")
+            # If HuggingFace fails, fall back to local model
+            try:
+                fallback_model = "google/flan-t5-base"
+                print(f"Falling back to local model: {fallback_model}")
+                
+                # Check if CUDA is available
+                device = 0 if torch.cuda.is_available() else -1
+                
+                # Use text2text-generation for T5 models
+                pipe = transformers.pipeline(
+                    "text2text-generation",
+                    model=fallback_model,
+                    device=device,
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                    max_new_tokens=512
+                )
+                
+                # Create an instance of our LangChain-compatible wrapper
+                return HFWrapper(pipeline=pipe, is_t5=True)
+            except Exception as inner_e:
+                raise HTTPException(status_code=500, detail=f"Error loading fallback model: {str(inner_e)}")
+    
+    elif provider == "azure":
+        # Use Azure OpenAI
+        try:
+            # Set environment variables directly before initializing client
+            os.environ["OPENAI_API_KEY"] = token
+            os.environ["OPENAI_API_VERSION"] = config_to_use.get("api_version", "2024-05-01-preview")
+            os.environ["OPENAI_API_BASE"] = config_to_use.get("azure_endpoint", "")
+            os.environ["OPENAI_API_TYPE"] = "azure"
+
+            print(f"Using Azure OpenAI with token: {token[:5]}..., endpoint: {config_to_use.get('azure_endpoint')}, version: {config_to_use.get('api_version')}")
+
+            return AzureOpenAI(
+                deployment_name=config_to_use.get("azure_deployment"),
+                model_name=model,
+                temperature=0.5,
+                max_tokens=512
+            )
+        except Exception as e:
+            # Print full error for debugging
+            import traceback
+            print(f"Error loading Azure OpenAI model: {str(e)}")
+            print(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=f"Error loading Azure OpenAI model: {str(e)}")
+    
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported LLM provider: {provider}")
+
+# Function to get retriever
+def get_retriever():
+    # Don't rely on the global variable - always load from disk to ensure freshness
+    # This ensures we're always using the latest vectorstore that was created during ingestion
+    
+    # Check if vectorstore exists
+    if not os.path.exists("./vectorstore"):
+        return None
+    
+    # Always load from disk to ensure we have the latest data
+    try:
+        print("Loading vectorstore from disk...")
+        embeddings = get_embeddings()
+        vs = FAISS.load_local("./vectorstore", embeddings, allow_dangerous_deserialization=True)
+        return vs.as_retriever(search_kwargs={"k": 4})
+    except Exception as e:
+        print(f"Error loading vectorstore: {e}")
+        return None
+
+# Create RAG chain
+def create_rag_chain():
+    # This creates a function that always returns the same message
+    def create_error_message_chain(message):
+        def error_fn(x):
+            return message
+        # Wrap the function in a RunnableLambda to make it compatible with LangServe
+        return RunnableLambda(error_fn)
+    
+    try:
+        # Get retriever
+        retriever = get_retriever()
+        
+        if retriever is None:
+            # Return a Runnable that just returns a message
+            return create_error_message_chain("No documents have been ingested yet. Please ingest some documents first.")
+        
+        # Get LLM
+        llm = get_llm()
+        
+        # RAG prompt template
+        template = """
+        You are an AI assistant for question-answering tasks. Use the following pieces of retrieved context to answer the user's question. 
+        If you don't know the answer or if the answer is not contained in the provided context, just say that you don't know.
+        Use only the information provided in the context to answer the question. Do not use prior knowledge.
+        Keep the answer concise - no more than three sentences maximum.
+        
+        Question: {question} 
+        
+        Context: {context} 
+        
+        Answer:
+        """
+        
+        # Create prompt
+        rag_prompt = PromptTemplate.from_template(template)
+        
+        # Set up the RAG chain
+        def format_docs(docs):
+            return "\n\n".join([d.page_content for d in docs])
+        
+        chain = (
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            | rag_prompt
+            | llm
+            | StrOutputParser()
+        )
+        
+        return chain
+    
+    except Exception as e:
+        # Return a Runnable that just returns the error message
+        return create_error_message_chain(f"Error creating RAG chain: {str(e)}")
+
+# Create the RAG chain for LangServe
+rag_chain = create_rag_chain()
+
+# Query endpoint
+@router.post("/query")
+async def query(request: QueryRequest):
+    try:
+        if not get_retriever():
+            return {"status": "error", "message": "No vector store available. Please ingest documents first."}
+        
+        # Execute the chain
+        raw_answer = rag_chain.invoke(request.question)
+        
+        # Clean up the response - extract just the answer portion
+        answer = raw_answer
+        
+        # If the response contains the prompt template, extract just the answer
+        if "Answer:" in raw_answer:
+            answer = raw_answer.split("Answer:")[-1].strip()
+        
+        # Only include sources if requested
+        response = {"answer": answer}
+        
+        # Get the source documents for reference but don't include them by default
+        retriever = get_retriever()
+        docs = retriever.get_relevant_documents(request.question)
+        
+        # Only include sources if specifically requested in the frontend
+        if hasattr(request, 'include_sources') and request.include_sources:
+            sources = [doc.page_content for doc in docs]
+            response["sources"] = sources
+        
+        return response
+    
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# LangServe compatible endpoint
+@router.post("/rag")
+async def rag(input_data: Dict[str, Any]):
+    try:
+        question = input_data.get("input", {}).get("question", "")
+        if not question:
+            return {"status": "error", "message": "No question provided"}
+        
+        # Use the same function as /query endpoint
+        result = await query(QueryRequest(question=question))
+        
+        # Format response for LangServe
+        if "answer" in result:
+            return {"output": result["answer"]}
+        else:
+            return {"output": f"Error: {result.get('message', 'Unknown error')}"}
+            
+    except Exception as e:
+        return {"output": f"Error: {str(e)}"} 

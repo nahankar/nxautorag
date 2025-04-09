@@ -1,0 +1,74 @@
+import os
+import json
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_openai import OpenAIEmbeddings, AzureOpenAIEmbeddings
+from langchain_core.embeddings import FakeEmbeddings
+
+# Default embedding model
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+def get_embeddings():
+    """Get an embeddings model that works with the current setup"""
+    # First try to load config from file if it exists
+    try:
+        if os.path.exists("./configs/latest.json"):
+            with open("./configs/latest.json", "r") as f:
+                config = json.loads(f.read())
+                llm_config = config.get("llm_config", {})
+                # If we have an API token, prefer using that provider's embeddings
+                if llm_config.get("api_token") and llm_config.get("llm_provider") == "azure":
+                    # Set environment variables directly before creating the embeddings
+                    os.environ["OPENAI_API_KEY"] = llm_config.get("api_token")
+                    os.environ["OPENAI_API_VERSION"] = llm_config.get("api_version", "2024-05-01-preview")
+                    os.environ["OPENAI_API_BASE"] = llm_config.get("azure_endpoint", "")
+                    os.environ["OPENAI_API_TYPE"] = "azure"
+                    
+                    # First try with standard embedding model, then fall back to using the same deployment
+                    try:
+                        return AzureOpenAIEmbeddings(
+                            azure_deployment="text-embedding-ada-002"
+                        )
+                    except Exception as embedding_error:
+                        print(f"Error with text-embedding-ada-002: {embedding_error}")
+                        print("Falling back to using chat model deployment for embeddings")
+                        # Fall back to using the same deployment as the chat model
+                        return AzureOpenAIEmbeddings(
+                            azure_deployment=llm_config.get("azure_deployment")
+                        )
+    except Exception as e:
+        print(f"Error loading config for embeddings: {e}")
+        
+    # Try HuggingFace embeddings as the primary option
+    try:
+        return HuggingFaceEmbeddings(model_name=DEFAULT_EMBEDDING_MODEL)
+    except Exception as e:
+        print(f"Error loading HuggingFace embeddings: {e}")
+        
+    # Try using OpenAI embeddings as fallback if configured in environment
+    try:
+        return OpenAIEmbeddings(model="text-embedding-ada-002")
+    except Exception as e:
+        print(f"Error loading OpenAI embeddings: {e}")
+    
+    # Final fallback to fake embeddings for development
+    print("Using fake embeddings for development. For production, configure a real embeddings model.")
+    return FakeEmbeddings(size=384)  # 384 is typical for small models
+
+def save_vectorstore(vectorstore, path="./vectorstore"):
+    """Save the vectorstore to disk"""
+    vectorstore.save_local(path)
+    return True
+
+def load_vectorstore(path="./vectorstore"):
+    """Load the vectorstore from disk if it exists"""
+    if not os.path.exists(path):
+        return None
+    
+    embeddings = get_embeddings()
+    return FAISS.load_local(path, embeddings, allow_dangerous_deserialization=True)
+
+def create_empty_vectorstore():
+    """Create an empty vectorstore"""
+    embeddings = get_embeddings()
+    return FAISS.from_texts(["This is a placeholder document."], embeddings) 
