@@ -11,6 +11,18 @@ try:
 except ImportError:
     get_azure_embeddings = None
 
+# Add import for Google Drive storage
+try:
+    from utils.google_drive_storage import (
+        save_vectorstore_to_drive, 
+        get_latest_vectorstore_from_drive,
+        create_drive_folder
+    )
+except ImportError:
+    save_vectorstore_to_drive = None
+    get_latest_vectorstore_from_drive = None
+    create_drive_folder = None
+
 # Default embedding model
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -52,22 +64,76 @@ def get_embeddings():
     print("Using fake embeddings for development. For production, configure a real embeddings model.")
     return FakeEmbeddings(size=384)  # 384 is typical for small models
 
-def save_vectorstore(vectorstore, path="./vectorstore"):
-    """Save the vectorstore to disk"""
+def save_vectorstore(vectorstore, path="./vectorstore", storage_type="local"):
+    """Save the vectorstore to disk or Google Drive
+    
+    Args:
+        vectorstore: The vectorstore to save
+        path: Path for local storage
+        storage_type: 'local' or 'google_drive'
+    
+    Returns:
+        True if successful, False otherwise
+    """
     try:
+        # First save locally - required temporarily for Google Drive upload
         vectorstore.save_local(path)
-        print(f"Vectorstore saved successfully to {path}")
+        print(f"Vectorstore saved successfully to local path: {path}")
+        
         # Save embedding info for reference
         if hasattr(vectorstore, "_embedding_function") and hasattr(vectorstore._embedding_function, "_llm_type"):
             print(f"Saved with embedding type: {vectorstore._embedding_function._llm_type}")
+        
+        # If Google Drive is specified, upload to Drive
+        if storage_type == "google_drive" and save_vectorstore_to_drive:
+            print("Uploading vectorstore to Google Drive...")
+            success, error = save_vectorstore_to_drive(path)
+            if not success:
+                print(f"Error saving to Google Drive: {error}")
+                print("Note: Local vectorstore was still created but upload to Google Drive failed.")
+                return False
+            else:
+                print("Vectorstore successfully uploaded to Google Drive")
+                
+                # Clean up local files when Google Drive is selected as storage
+                import shutil
+                if os.path.exists(path):
+                    print(f"Removing temporary local vectorstore at {path}")
+                    shutil.rmtree(path)
+                    print("Local vectorstore removed after successful Google Drive upload")
+        
         return True
     except Exception as e:
         print(f"Error saving vectorstore: {e}")
         return False
 
-def load_vectorstore(path="./vectorstore"):
-    """Load the vectorstore from disk if it exists"""
+def load_vectorstore(path="./vectorstore", storage_type="local"):
+    """Load the vectorstore from disk or Google Drive
+    
+    Args:
+        path: Path for local storage
+        storage_type: 'local' or 'google_drive'
+    
+    Returns:
+        The loaded vectorstore or a new empty one
+    """
     try:
+        # If Google Drive is specified, download latest from Drive
+        if storage_type == "google_drive" and get_latest_vectorstore_from_drive:
+            print("Attempting to load vectorstore from Google Drive...")
+            success, error = get_latest_vectorstore_from_drive(local_path=path)
+            if not success:
+                print(f"Error loading from Google Drive: {error}")
+                if not os.path.exists(path) or not os.path.exists(os.path.join(path, "index.faiss")):
+                    print("No local backup vectorstore found. Creating a new empty one.")
+                    return create_empty_vectorstore()
+                # Fall back to local if it exists (unlikely with the new cleanup)
+                print("Using existing local vectorstore")
+            else:
+                print("Successfully loaded vectorstore from Google Drive")
+                return FAISS.load_local(path, get_embeddings(), allow_dangerous_deserialization=True)
+        
+        # Check if local vectorstore exists (for local storage type)
         if not os.path.exists(path):
             print(f"Vectorstore path {path} does not exist. Creating a new vectorstore.")
             return create_empty_vectorstore()
@@ -76,6 +142,7 @@ def load_vectorstore(path="./vectorstore"):
             print(f"FAISS index file not found at {path}/index.faiss. Creating a new vectorstore.")
             return create_empty_vectorstore()
             
+        # Load from local path
         embeddings = get_embeddings()
         return FAISS.load_local(path, embeddings, allow_dangerous_deserialization=True)
     except Exception as e:
@@ -94,3 +161,20 @@ def create_empty_vectorstore():
         # Last resort fallback to fake embeddings
         print("Using fake embeddings as last resort")
         return FAISS.from_texts(["This is a placeholder document."], FakeEmbeddings(size=384)) 
+
+def check_google_drive_connection():
+    """Check if Google Drive is properly connected and authorized.
+    
+    Returns:
+        (is_connected, message)
+    """
+    if not create_drive_folder:
+        return False, "Google Drive storage module not available"
+        
+    try:
+        folder_id, error = create_drive_folder()
+        if error:
+            return False, f"Error connecting to Google Drive: {error}"
+        return True, "Successfully connected to Google Drive"
+    except Exception as e:
+        return False, f"Error checking Google Drive connection: {str(e)}" 
