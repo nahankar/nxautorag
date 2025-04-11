@@ -223,7 +223,7 @@ async def process_google(google_config: GoogleConfig):
         if 'photos' in google_config.services:
             # Implementation here...
             pass
-            
+        
         return documents
     except Exception as e:
         print(f"Error processing Google services: {str(e)}")
@@ -350,7 +350,7 @@ async def ingest(
                 vectorstore.add_documents(split_documents)
             
             # Save vectorstore
-            save_result = save_vectorstore(vectorstore, storage_type=storage_type)
+            save_result = save_vectorstore(vectorstore, storage_type=storage_type, keep_local_copy=False)
             if not save_result:
                 raise HTTPException(status_code=500, detail="Failed to save vectorstore")
         
@@ -491,7 +491,7 @@ async def save_llm_settings(request: Dict[str, Any]):
         recreate_rag_chain()
         
         return {
-            "status": "success",
+            "status": "success", 
             "message": "LLM settings saved successfully"
         }
     

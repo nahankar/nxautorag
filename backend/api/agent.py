@@ -7,7 +7,7 @@ from langchain_community.vectorstores import FAISS
 import os
 import json
 from api.ingestion import global_config, vectorstore as ingestion_vectorstore
-from api.retrieval import get_llm
+from api.retrieval import get_llm, get_retriever, SearchOption, StorageType
 from utils.vectorstore import get_embeddings
 
 router = APIRouter()
@@ -15,21 +15,27 @@ router = APIRouter()
 # Pydantic model for agent query
 class AgentQueryRequest(BaseModel):
     question: str
+    search_option: SearchOption = SearchOption.SEMANTIC
+    storage_type: StorageType = StorageType.LOCAL
+
+# Global variables to store the search options for the tool
+current_search_option = SearchOption.SEMANTIC
+current_storage_type = StorageType.LOCAL
 
 # Tool for retrieving information from the vector store
 @tool
 def search_documents(query: str) -> str:
     """Search for information in the document database."""
     try:
-        # Don't rely on the global variable - always load from disk for consistency
-        if not os.path.exists("./vectorstore"):
-            return "No documents found in the database. Please ingest documents first."
+        # Use the retriever with the specified search option and storage type
+        retriever = get_retriever(current_search_option, current_storage_type)
         
-        embeddings = get_embeddings()
-        vs = FAISS.load_local("./vectorstore", embeddings, allow_dangerous_deserialization=True)
+        if retriever is None:
+            storage_name = "local storage" if current_storage_type == StorageType.LOCAL else "Google Drive"
+            return f"No documents found in {storage_name}. Please ingest documents first."
         
-        # Query for relevant documents
-        docs = vs.similarity_search(query, k=4)
+        # Get relevant documents
+        docs = retriever.get_relevant_documents(query)
         
         # Format results
         results = []
@@ -44,10 +50,18 @@ def search_documents(query: str) -> str:
 # Agent query endpoint
 @router.post("/agent-query")
 async def agent_query(request: AgentQueryRequest):
+    global current_search_option, current_storage_type
     try:
-        # Check if we have a vector store
-        if not os.path.exists("./vectorstore") and ingestion_vectorstore is None:
-            return {"answer": "No documents have been ingested yet. Please ingest documents first."}
+        # Set the current search and storage options for the tool
+        current_search_option = request.search_option
+        current_storage_type = request.storage_type
+        print(f"Using search option for agent: {current_search_option}, storage type: {current_storage_type}")
+        
+        # Verify the vectorstore exists for the selected storage type
+        retriever = get_retriever(current_search_option, current_storage_type)
+        if retriever is None:
+            storage_name = "local storage" if current_storage_type == StorageType.LOCAL else "Google Drive"
+            return {"answer": f"No documents found in {storage_name}. Please ingest documents first."}
         
         # Get LLM based on config
         llm = get_llm()

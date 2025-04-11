@@ -9,6 +9,7 @@ const QueryInterface = ({ setAnswer, setIsLoading: setGlobalIsLoading, setError:
   const [localAnswer, setLocalAnswer] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const [searchOption, setSearchOption] = useState('local_semantic');
   const navigate = useNavigate();
 
   // Handle form submission
@@ -21,9 +22,16 @@ const QueryInterface = ({ setAnswer, setIsLoading: setGlobalIsLoading, setError:
     setSources([]);
     
     try {
+      // Extract storage type and search method from searchOption
+      const storageType = searchOption.startsWith('google_drive_') ? 'google_drive' : 'local';
+      const searchMethod = searchOption.includes('hybrid') ? 'hybrid' : 
+                           searchOption.includes('reranking') ? 'reranking' : 'semantic';
+      
       const response = await axios.post('http://localhost:8000/query', {
         question: query,
-        include_sources: showSources
+        include_sources: showSources,
+        search_option: searchMethod,
+        storage_type: storageType
       });
       
       setLocalAnswer(response.data.answer || '');
@@ -51,8 +59,17 @@ const QueryInterface = ({ setAnswer, setIsLoading: setGlobalIsLoading, setError:
     setGlobalError('');
     
     try {
+      // Extract storage type and search method from searchOption
+      const storageType = searchOption.startsWith('google_drive_') ? 'google_drive' : 'local';
+      const searchMethod = searchOption.includes('hybrid') ? 'hybrid' : 
+                           searchOption.includes('reranking') ? 'reranking' : 'semantic';
+                           
       // Send request to agent endpoint
-      const response = await axios.post('http://localhost:8000/agent-query', { question: query });
+      const response = await axios.post('http://localhost:8000/agent-query', { 
+        question: query,
+        search_option: searchMethod,
+        storage_type: storageType
+      });
       
       if (response.data.answer) {
         setLocalAnswer(response.data.answer);
@@ -124,6 +141,112 @@ const QueryInterface = ({ setAnswer, setIsLoading: setGlobalIsLoading, setError:
                 <label htmlFor="showSources" className="ml-2 block text-sm text-gray-700">
                   Include sources in response
                 </label>
+              </div>
+            </div>
+            
+            <div className="mb-6">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Retrieve from:
+              </label>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="flex items-center">
+                  <input
+                    id="local-storage"
+                    type="radio"
+                    name="storage-option"
+                    value="local"
+                    checked={searchOption.startsWith('local_')}
+                    onChange={() => {
+                      // Keep the search method, just change the storage prefix
+                      const method = searchOption.split('_')[1] || 'semantic';
+                      setSearchOption(`local_${method}`);
+                    }}
+                    className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300"
+                  />
+                  <label htmlFor="local-storage" className="ml-2 block text-sm text-gray-700">
+                    Local Storage
+                  </label>
+                </div>
+                <div className="flex items-center">
+                  <input
+                    id="google-drive-storage"
+                    type="radio"
+                    name="storage-option"
+                    value="google_drive"
+                    checked={searchOption.startsWith('google_drive_')}
+                    onChange={() => {
+                      // Keep the search method, just change the storage prefix
+                      const method = searchOption.split('_')[2] || 'semantic';
+                      setSearchOption(`google_drive_${method}`);
+                    }}
+                    className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300"
+                  />
+                  <label htmlFor="google-drive-storage" className="ml-2 block text-sm text-gray-700">
+                    Google Drive
+                  </label>
+                </div>
+              </div>
+            </div>
+            
+            <div className="mb-6">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Search Method:
+              </label>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div className="flex items-center">
+                  <input
+                    id="semantic"
+                    type="radio"
+                    name="search-option"
+                    value="semantic"
+                    checked={searchOption.includes('semantic')}
+                    onChange={() => {
+                      // Keep the storage prefix, just change the method
+                      const prefix = searchOption.startsWith('google_drive_') ? 'google_drive_' : 'local_';
+                      setSearchOption(`${prefix}semantic`);
+                    }}
+                    className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300"
+                  />
+                  <label htmlFor="semantic" className="ml-2 block text-sm text-gray-700">
+                    Semantic (KNN)
+                  </label>
+                </div>
+                <div className="flex items-center">
+                  <input
+                    id="hybrid"
+                    type="radio"
+                    name="search-option"
+                    value="hybrid"
+                    checked={searchOption.includes('hybrid')}
+                    onChange={() => {
+                      // Keep the storage prefix, just change the method
+                      const prefix = searchOption.startsWith('google_drive_') ? 'google_drive_' : 'local_';
+                      setSearchOption(`${prefix}hybrid`);
+                    }}
+                    className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300"
+                  />
+                  <label htmlFor="hybrid" className="ml-2 block text-sm text-gray-700">
+                    Hybrid (Sparse+Dense)
+                  </label>
+                </div>
+                <div className="flex items-center">
+                  <input
+                    id="reranking"
+                    type="radio"
+                    name="search-option"
+                    value="reranking"
+                    checked={searchOption.includes('reranking')}
+                    onChange={() => {
+                      // Keep the storage prefix, just change the method
+                      const prefix = searchOption.startsWith('google_drive_') ? 'google_drive_' : 'local_';
+                      setSearchOption(`${prefix}reranking`);
+                    }}
+                    className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300"
+                  />
+                  <label htmlFor="reranking" className="ml-2 block text-sm text-gray-700">
+                    Re-Ranking
+                  </label>
+                </div>
               </div>
             </div>
             

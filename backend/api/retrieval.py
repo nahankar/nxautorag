@@ -16,16 +16,33 @@ from utils.vectorstore import get_embeddings
 from utils.azure_openai_client import get_azure_openai_client, create_error_chain
 import json
 from langchain.llms.base import LLM
+from enum import Enum
+from langchain.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
+from utils.google_drive_storage import get_latest_vectorstore_from_drive
 
 # Import global config from ingestion
 from api.ingestion import global_config, vectorstore as ingestion_vectorstore
 
 router = APIRouter()
 
+# Define SearchOption enum for validation
+class SearchOption(str, Enum):
+    SEMANTIC = "semantic"
+    HYBRID = "hybrid"
+    RERANKING = "reranking"
+
+# Define StorageType enum for validation
+class StorageType(str, Enum):
+    LOCAL = "local"
+    GOOGLE_DRIVE = "google_drive"
+
 # Pydantic model for query request
 class QueryRequest(BaseModel):
     question: str
     include_sources: bool = False
+    search_option: SearchOption = SearchOption.SEMANTIC
+    storage_type: StorageType = StorageType.LOCAL
 
 # Global variable declarations
 rag_chain = None
@@ -192,15 +209,60 @@ def get_llm():
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported LLM provider: {provider}")
 
-# Function to get retriever
-def get_retriever():
-    """Load the vectorstore from disk if it exists"""
-    try:
-        print("Loading vectorstore from disk...")
+def load_vectorstore_by_storage_type(storage_type=StorageType.LOCAL):
+    """Load the vectorstore based on storage type specified.
+    
+    Args:
+        storage_type: Either 'local' or 'google_drive'
         
-        # Check if vectorstore exists
-        if not os.path.exists("./vectorstore"):
-            print("Vectorstore directory does not exist")
+    Returns:
+        The loaded vectorstore or None if it fails
+    """
+    try:
+        from utils.vectorstore import get_embeddings
+        embeddings = get_embeddings()
+        
+        if storage_type == StorageType.LOCAL:
+            # Check if local vectorstore exists
+            if not os.path.exists("./vectorstore") or not os.path.exists("./vectorstore/index.faiss"):
+                print("Local vectorstore not found")
+                return None
+                
+            # Load from local
+            return FAISS.load_local("./vectorstore", embeddings, allow_dangerous_deserialization=True)
+            
+        elif storage_type == StorageType.GOOGLE_DRIVE:
+            # Import Google Drive storage utilities
+            from utils.google_drive_storage import get_latest_vectorstore_from_drive
+            
+            # Create a temporary directory for the downloaded vectorstore
+            import tempfile
+            temp_dir = tempfile.mkdtemp()
+            
+            # Try to download and load from Google Drive
+            success, error = get_latest_vectorstore_from_drive(local_path=temp_dir)
+            if not success:
+                print(f"Error loading from Google Drive: {error}")
+                return None
+                
+            # Load the downloaded vectorstore
+            return FAISS.load_local(temp_dir, embeddings, allow_dangerous_deserialization=True)
+            
+    except Exception as e:
+        print(f"Error loading vectorstore: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# Create retriever based on search option and storage type
+def get_retriever(search_option=SearchOption.SEMANTIC, storage_type=StorageType.LOCAL):
+    """Create a retriever based on search option and storage type."""
+    try:
+        # Load vectorstore based on storage type
+        vs = load_vectorstore_by_storage_type(storage_type)
+        
+        if vs is None:
+            print(f"Failed to load vectorstore from {storage_type}")
             return None
         
         # Get embeddings model
@@ -216,13 +278,101 @@ def get_retriever():
                 print(f"Error creating direct HuggingFace embeddings: {e}")
                 return None
         
-        # Load from disk with specific embeddings
-        try:
-            vs = FAISS.load_local("./vectorstore", embeddings, allow_dangerous_deserialization=True)
-            return vs.as_retriever(search_kwargs={"k": 3})  # Return as retriever with k=3
-        except Exception as e:
-            print(f"Error loading vectorstore: {e}")
-            return None
+        # 1. Semantic Search (default KNN)
+        if search_option == SearchOption.SEMANTIC:
+            print("Using Semantic (KNN) search retriever")
+            return vs.as_retriever(search_kwargs={"k": 3})
+        
+        # 2. Hybrid Search (Combined sparse and dense retrieval)
+        elif search_option == SearchOption.HYBRID:
+            print("Using Hybrid (Sparse+Dense) search retriever")
+            try:
+                # Get all documents from vectorstore to initialize BM25
+                # This is a simplified approach; in production you might want to use a persistent BM25 index
+                print("Loading documents for BM25 retriever...")
+                docs = vs.similarity_search("", k=1000)  # Get a large sample of docs for BM25 index
+                
+                # Create BM25 retriever from documents
+                bm25_retriever = BM25Retriever.from_documents(docs)
+                bm25_retriever.k = 3  # Return top 3 results
+                
+                # Create vector retriever
+                faiss_retriever = vs.as_retriever(search_kwargs={"k": 3})
+                
+                # Combine retrievers with equal weights (0.5 each)
+                return EnsembleRetriever(
+                    retrievers=[bm25_retriever, faiss_retriever], 
+                    weights=[0.5, 0.5]
+                )
+            except Exception as e:
+                print(f"Error setting up hybrid search: {e}, falling back to semantic search")
+                return vs.as_retriever(search_kwargs={"k": 3})
+        
+        # 3. Re-ranking Search
+        elif search_option == SearchOption.RERANKING:
+            print("Using Re-ranking search retriever")
+            try:
+                # Import the MultiQueryRetriever for query expansion
+                from langchain.retrievers.multi_query import MultiQueryRetriever
+                from langchain_core.language_models import LLM as CoreLLM
+                
+                # First get a larger number of candidates using standard retrieval
+                base_retriever = vs.as_retriever(search_kwargs={"k": 10})
+                
+                # Try to import the cross-encoder
+                try:
+                    from sentence_transformers import CrossEncoder
+                    
+                    # Create a reranking wrapper function using the cross-encoder
+                    print("Loading cross-encoder model for reranking...")
+                    cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+                    
+                    def reranker_retriever(query):
+                        # Get documents from the base retriever
+                        docs = base_retriever.get_relevant_documents(query)
+                        
+                        if not docs:
+                            return []
+                                
+                        # Prepare document-query pairs for the cross-encoder
+                        pairs = [(query, doc.page_content) for doc in docs]
+                        
+                        # Get scores from the cross-encoder
+                        scores = cross_encoder.predict(pairs)
+                        
+                        # Sort documents by scores
+                        scored_docs = list(zip(docs, scores))
+                        sorted_docs = [doc for doc, score in sorted(scored_docs, key=lambda x: x[1], reverse=True)]
+                        
+                        # Return the top 3 reranked documents
+                        return sorted_docs[:3]
+                    
+                    # Create a callable class to wrap the reranker function
+                    class RerankerRetriever:
+                        def get_relevant_documents(self, query):
+                            return reranker_retriever(query)
+                            
+                    return RerankerRetriever()
+                    
+                except ImportError:
+                    print("Cross-encoder not available, falling back to MultiQueryRetriever")
+                    # If cross-encoder is not available, use MultiQueryRetriever for query expansion
+                    # Get LLM for query generation
+                    llm = get_llm()
+                    
+                    # Create and return the MultiQueryRetriever
+                    return MultiQueryRetriever.from_llm(
+                        retriever=base_retriever,
+                        llm=llm
+                    )
+            except Exception as e:
+                print(f"Error setting up reranking: {e}, falling back to semantic search")
+                return vs.as_retriever(search_kwargs={"k": 3})
+        
+        # Default to semantic search if an unknown option is provided
+        else:
+            print(f"Unknown search option: {search_option}, defaulting to semantic search")
+            return vs.as_retriever(search_kwargs={"k": 3})
             
     except Exception as e:
         print(f"Error in get_retriever: {e}")
@@ -242,7 +392,7 @@ def create_rag_chain():
         return RunnableLambda(error_fn)
     
     try:
-        # Get retriever and the number of documents to retrieve based on model
+        # Get retriever (using default semantic search)
         print("Getting retriever from vectorstore...")
         retriever = get_retriever()
         
@@ -398,28 +548,145 @@ rag_chain = create_rag_chain()
 async def query(request: QueryRequest):
     global rag_chain
     try:
-        # Check if vectorstore exists by checking the directory
-        if not os.path.exists("./vectorstore") or not os.path.exists("./vectorstore/index.faiss"):
-            return {"status": "error", "message": "No vector store available. Please ingest documents first."}
+        # Get the appropriate retriever based on the search option and storage type
+        print(f"Using search option: {request.search_option}, storage type: {request.storage_type}")
+        retriever = get_retriever(request.search_option, request.storage_type)
         
-        # If rag_chain is None, recreate it
-        if rag_chain is None:
-            rag_chain = create_rag_chain()
+        if retriever is None:
+            storage_name = "local storage" if request.storage_type == StorageType.LOCAL else "Google Drive"
+            return {"status": "error", "message": f"No vector store available in {storage_name}. Please ingest documents first."}
         
-        # Execute the chain
+        # Define format_docs function
+        def format_docs(docs):
+            # Check if we have any documents
+            if not docs or len(docs) == 0:
+                print("WARNING: No documents retrieved from the vectorstore")
+                return "No relevant documents found in the knowledge base."
+                
+            # Load latest model config to determine context size
+            model_name = "default"
+            max_per_doc = 1000  # Default per-document limit
+            max_total = 2400    # Default total limit
+            
+            try:
+                if os.path.exists("./configs/latest.json"):
+                    with open("./configs/latest.json", "r") as f:
+                        config_data = json.load(f)
+                        llm_config = config_data.get("llm_config", {})
+                        model_name = llm_config.get("llm_model", "").lower()
+                        provider = llm_config.get("llm_provider", "").lower()
+                        
+                        # Adjust limits based on model capabilities
+                        if provider == "azure":
+                            if "gpt-4" in model_name:
+                                max_per_doc = 2000
+                                max_total = 6000
+                            elif "gpt-35-turbo" in model_name or "gpt-3.5-turbo" in model_name:
+                                max_per_doc = 1500
+                                max_total = 4000
+                        elif "mistral" in model_name or "mixtral" in model_name:
+                            max_per_doc = 1800
+                            max_total = 5400
+            except Exception as e:
+                print(f"Error determining context size from model: {e}")
+            
+            # Extra logging to see exactly what's in each document
+            print(f"Number of documents retrieved: {len(docs)}")
+            print(f"Using model: {model_name}, max_per_doc: {max_per_doc}, max_total: {max_total}")
+            
+            for i, doc in enumerate(docs):
+                print(f"Document {i+1} length: {len(doc.page_content)} characters")
+                print(f"Document {i+1} snippet: {doc.page_content[:100]}...")
+            
+            # Extract text from each document with model-specific limits
+            formatted_content = "\n\n".join([d.page_content[:max_per_doc] for d in docs])
+            
+            # Use model-specific total limit
+            if len(formatted_content) > max_total:
+                formatted_content = formatted_content[:max_total] + "..."
+            
+            # Debug logging
+            print(f"Final context length: {len(formatted_content)} characters")
+            
+            # Validate minimum context size
+            if len(formatted_content) < 200:
+                print("WARNING: Context is too small, adding placeholder to prevent hallucinations")
+                formatted_content += "\n\nNote: The context available is very limited. If you don't know the answer based on this context, please say so rather than guessing."
+                
+            return formatted_content
+        
+        # Create a custom RAG chain for this specific search option
+        def retrieve_and_format(query):
+            # Use the specific retriever for this request
+            docs = retriever.get_relevant_documents(query)
+            return format_docs(docs)
+        
+        # Get LLM
+        llm = get_llm()
+        
+        # RAG prompt template
+        template = """
+        You are an AI assistant for question-answering tasks. Use the following pieces of retrieved context to answer the user's question. 
+        If you don't know the answer or if the answer is not contained in the provided context, just say that you don't know.
+        
+        Use only the information provided in the context to answer the question. Do not use prior knowledge.
+        
+        IMPORTANT: Even if the context is brief or consists of Excel spreadsheet content, please provide a complete answer 
+        with detailed explanation. If you see phrases or terms from spreadsheets, explain what they likely mean 
+        based on the context.
+        
+        You have been provided with larger context than before, so make full use of all the information to give
+        a comprehensive answer. Focus on detail and specifics from the context rather than general statements.
+        
+        Aim to provide a detailed 3-5 sentence response that fully explains the answer to the question.
+        
+        Question: {question} 
+        
+        Context: {context} 
+        
+        Answer:
+        """
+        
+        # Create prompt
+        rag_prompt = PromptTemplate.from_template(template)
+        
+        # Create the custom RAG chain for this query
+        custom_chain = (
+            {"context": retrieve_and_format, "question": RunnablePassthrough()}
+            | rag_prompt
+            | llm
+            | StrOutputParser()
+        )
+        
+        # Execute the custom chain
         try:
-            raw_answer = rag_chain.invoke(request.question)
+            raw_answer = custom_chain.invoke(request.question)
             
             # Check if answer indicates no documents (probably an error chain response)
             if "no documents have been ingested" in raw_answer.lower():
-                print("ERROR: rag_chain returned 'no documents' error despite vectorstore existing")
-                print("Attempting to recreate the RAG chain...")
+                print("ERROR: chain returned 'no documents' error despite vectorstore existing")
+                print("Attempting to recreate the retriever...")
                 
-                # Try to recreate the chain
-                rag_chain = create_rag_chain()
+                # Try with a different retriever
+                retriever = get_retriever(SearchOption.SEMANTIC)
+                if retriever is None:
+                    return {"answer": "Sorry, no documents were found to answer your question."}
+                    
+                # Try again with the new retriever
+                def retrieve_and_format_fallback(query):
+                    docs = retriever.get_relevant_documents(query)
+                    return format_docs(docs)
+                    
+                # Create a fallback chain
+                fallback_chain = (
+                    {"context": retrieve_and_format_fallback, "question": RunnablePassthrough()}
+                    | rag_prompt
+                    | llm
+                    | StrOutputParser()
+                )
                 
-                # Try again with the new chain
-                raw_answer = rag_chain.invoke(request.question)
+                # Try again with the fallback chain
+                raw_answer = fallback_chain.invoke(request.question)
         except Exception as model_error:
             # Handle model errors gracefully
             print(f"Model error: {str(model_error)}")
@@ -492,7 +759,8 @@ async def query(request: QueryRequest):
         
         # Get the source documents for reference but don't include them by default
         if hasattr(request, 'include_sources') and request.include_sources:
-            retriever = get_retriever()
+            # Use the same retriever with the specified search option
+            retriever = get_retriever(request.search_option)
             docs = retriever.get_relevant_documents(request.question)
             sources = [doc.page_content[:500] for doc in docs]  # Limit source length
             response["sources"] = sources

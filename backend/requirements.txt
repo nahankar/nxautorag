@@ -17,12 +17,16 @@ sse_starlette>=1.6.0
 # If you want to use Hugging Face models (optional)
 huggingface-hub>=0.30.0
 transformers>=4.40.0,<4.50.0
-sentence-transformers>=4.0.0
+sentence-transformers>=2.2.2
 
 # For OpenAI models (recommended)
 openai>=1.7.0
 azure-identity>=1.21.0
 torch>=2.0.0
+
+# For hybrid search and reranking
+rank-bm25>=0.2.2
+nltk>=3.8.1
 
 # Google API libraries
 google-auth==2.16.0

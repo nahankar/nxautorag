@@ -64,19 +64,20 @@ def get_embeddings():
     print("Using fake embeddings for development. For production, configure a real embeddings model.")
     return FakeEmbeddings(size=384)  # 384 is typical for small models
 
-def save_vectorstore(vectorstore, path="./vectorstore", storage_type="local"):
+def save_vectorstore(vectorstore, path="./vectorstore", storage_type="local", keep_local_copy=False):
     """Save the vectorstore to disk or Google Drive
     
     Args:
         vectorstore: The vectorstore to save
         path: Path for local storage
         storage_type: 'local' or 'google_drive'
+        keep_local_copy: If False and using Google Drive, will delete local copy after upload
     
     Returns:
         True if successful, False otherwise
     """
     try:
-        # First save locally - required temporarily for Google Drive upload
+        # First save locally - always required because Google Drive upload needs local files
         vectorstore.save_local(path)
         print(f"Vectorstore saved successfully to local path: {path}")
         
@@ -90,17 +91,23 @@ def save_vectorstore(vectorstore, path="./vectorstore", storage_type="local"):
             success, error = save_vectorstore_to_drive(path)
             if not success:
                 print(f"Error saving to Google Drive: {error}")
-                print("Note: Local vectorstore was still created but upload to Google Drive failed.")
+                print("Note: Local vectorstore was still created as a temporary storage for Google Drive upload.")
                 return False
             else:
                 print("Vectorstore successfully uploaded to Google Drive")
                 
-                # Clean up local files when Google Drive is selected as storage
-                import shutil
-                if os.path.exists(path):
-                    print(f"Removing temporary local vectorstore at {path}")
-                    shutil.rmtree(path)
-                    print("Local vectorstore removed after successful Google Drive upload")
+                # Delete local copy if requested
+                if not keep_local_copy:
+                    try:
+                        import shutil
+                        print(f"Deleting local vectorstore copy at {path}...")
+                        if os.path.exists(path):
+                            shutil.rmtree(path)
+                            print("Local vectorstore copy deleted successfully.")
+                    except Exception as delete_error:
+                        print(f"Warning: Failed to delete local vectorstore: {delete_error}")
+                else:
+                    print("Keeping local vectorstore copy as backup.")
         
         return True
     except Exception as e:
@@ -124,16 +131,15 @@ def load_vectorstore(path="./vectorstore", storage_type="local"):
             success, error = get_latest_vectorstore_from_drive(local_path=path)
             if not success:
                 print(f"Error loading from Google Drive: {error}")
-                if not os.path.exists(path) or not os.path.exists(os.path.join(path, "index.faiss")):
-                    print("No local backup vectorstore found. Creating a new empty one.")
+                if not os.path.exists(path):
+                    print("Local vectorstore doesn't exist. Creating a new one.")
                     return create_empty_vectorstore()
-                # Fall back to local if it exists (unlikely with the new cleanup)
-                print("Using existing local vectorstore")
+                # Fall back to local if it exists
+                print("Falling back to local vectorstore if it exists")
             else:
                 print("Successfully loaded vectorstore from Google Drive")
-                return FAISS.load_local(path, get_embeddings(), allow_dangerous_deserialization=True)
         
-        # Check if local vectorstore exists (for local storage type)
+        # Check if local vectorstore exists
         if not os.path.exists(path):
             print(f"Vectorstore path {path} does not exist. Creating a new vectorstore.")
             return create_empty_vectorstore()

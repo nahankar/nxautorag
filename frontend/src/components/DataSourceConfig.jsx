@@ -18,6 +18,13 @@ const DataSourceConfig = () => {
   });
   const [files, setFiles] = useState([]);
 
+  // Storage configuration
+  const [storageConfig, setStorageConfig] = useState({
+    type: 'local'
+  });
+  const [storageOptions, setStorageOptions] = useState([]);
+  const [isLoadingStorageOptions, setIsLoadingStorageOptions] = useState(false);
+
   // LLM config state
   const [llmConfig, setLlmConfig] = useState({
     llm_provider: 'local',
@@ -50,6 +57,7 @@ const DataSourceConfig = () => {
   // Load latest configuration on mount and when sourceType changes
   useEffect(() => {
     fetchLatestConfig();
+    fetchStorageOptions();
   }, [sourceType]);
 
   // Check Google auth status when Google tab is selected
@@ -58,6 +66,19 @@ const DataSourceConfig = () => {
       checkGoogleAuthStatus();
     }
   }, [sourceType]);
+  
+  // Make sure Drive is selected after authentication is successful
+  useEffect(() => {
+    if (googleAuthStatus && googleAuthStatus.is_authenticated) {
+      // Ensure 'drive' is in services if authenticated and not already there
+      if (!googleConfig.services.includes('drive')) {
+        setGoogleConfig(prev => ({
+          ...prev,
+          services: [...prev.services, 'drive']
+        }));
+      }
+    }
+  }, [googleAuthStatus]);
 
   // Check URL parameters for auth callback
   useEffect(() => {
@@ -81,6 +102,29 @@ const DataSourceConfig = () => {
     }
   }, []);
 
+  // Fetch storage options
+  const fetchStorageOptions = async () => {
+    setIsLoadingStorageOptions(true);
+    try {
+      const response = await axios.get('http://localhost:8000/storage-options');
+      if (response.data && response.data.status === 'success') {
+        setStorageOptions(response.data.options || []);
+      }
+    } catch (err) {
+      console.error('Failed to fetch storage options:', err);
+      setStorageOptions([
+        {
+          id: 'local',
+          name: 'Local Storage',
+          description: 'Store vectorstore on the local server',
+          available: true
+        }
+      ]);
+    } finally {
+      setIsLoadingStorageOptions(false);
+    }
+  };
+
   // Fetch the latest configuration from the server
   const fetchLatestConfig = async () => {
     setIsLoadingConfig(true);
@@ -96,6 +140,23 @@ const DataSourceConfig = () => {
           setMysqlConfig(response.data.mysql_config);
         } else if (sourceType === 'url' && response.data.url_config) {
           setUrlConfig(response.data.url_config);
+        } else if (sourceType === 'google' && response.data.google_config) {
+          // Make sure to properly set the google config including services
+          setGoogleConfig(response.data.google_config);
+          
+          // Ensure 'drive' is included if authenticated
+          if (googleAuthStatus && googleAuthStatus.is_authenticated && 
+              !response.data.google_config.services.includes('drive')) {
+            setGoogleConfig(prev => ({
+              ...prev,
+              services: [...(prev.services || []), 'drive']
+            }));
+          }
+        }
+
+        // Set storage config if available
+        if (response.data.storage_config) {
+          setStorageConfig(response.data.storage_config);
         }
       }
     } catch (err) {
@@ -134,6 +195,10 @@ const DataSourceConfig = () => {
 
   const handleFileChange = (e) => {
     setFiles(Array.from(e.target.files).slice(0, 5)); // Limit to max 5 files
+  };
+
+  const handleStorageChange = (e) => {
+    setStorageConfig({ ...storageConfig, type: e.target.value });
   };
 
   const handleLlmChange = (e) => {
@@ -198,52 +263,80 @@ const DataSourceConfig = () => {
       // Create form data
       const formData = new FormData();
       
-      // Create configuration object
-      const configData = {
-        sourceType,
-        llm_config: llmConfig,
-        ...(sourceType === 'mysql' ? { mysql_config: mysqlConfig } : {}),
-        ...(sourceType === 'url' ? { url_config: urlConfig } : {}),
-        ...(sourceType === 'google' ? { google_config: googleConfig } : {})
+      // Prepare configuration object
+      const configObject = {
+        sourceType: sourceType,
+        storage_config: storageConfig  // Add storage config
       };
       
-      // Add configuration to form data
-      formData.append('config', JSON.stringify(configData));
-      
-      // Handle file uploads
-      if (sourceType === 'file') {
-        for (const file of files) {
-          formData.append('files', file);
-        }
-        // Also add file metadata to config
-        formData.append('file_metadata', JSON.stringify(Array.from(files).map(f => ({
-          name: f.name,
-          type: f.type,
-          size: f.size,
-          lastModified: f.lastModified
-        }))));
+      // Add selected source config
+      if (sourceType === 'mysql') {
+        configObject.mysql_config = mysqlConfig;
+      } else if (sourceType === 'url') {
+        configObject.url_config = urlConfig;
+      } else if (sourceType === 'google') {
+        configObject.google_config = googleConfig;
+      } else if (sourceType === 'llm') {
+        configObject.llm_config = llmConfig;
       }
       
-      // Submit data
-      const response = await axios.post('http://localhost:8000/ingest', formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data'
-        }
-      });
+      // If using Google Drive storage but not authenticated
+      if (storageConfig.type === 'google_drive' && 
+          (!googleAuthStatus || !googleAuthStatus.is_authenticated)) {
+        setError("You must be authenticated with Google to use Google Drive storage.");
+        setIsLoading(false);
+        return;
+      }
       
-      if (response.data.status === 'Ingestion Successful') {
-        setMessage(`Configuration saved and data ingested successfully ✅ ${response.data.files_stored ? `(${response.data.files_stored} files stored)` : ''}`);
-        // Refresh latest config after saving
-        fetchLatestConfig();
-      } else if (response.data.status === 'Config saved') {
-        setMessage('Configuration saved successfully ✅');
-        // Refresh latest config after saving
-        fetchLatestConfig();
+      let response;
+      
+      // Use different endpoint for LLM settings
+      if (sourceType === 'llm') {
+        // For LLM settings, use dedicated endpoint without form data
+        response = await axios.post('http://localhost:8000/save-llm-settings', configObject);
       } else {
-        setError(response.data.message || 'An error occurred');
+        // Add files if file source selected
+        if (sourceType === 'file' && files.length > 0) {
+          files.forEach(file => {
+            formData.append('files', file);
+          });
+        }
+        
+        // Always include LLM config
+        configObject.llm_config = llmConfig;
+        
+        // Add config as JSON string
+        formData.append('config', JSON.stringify(configObject));
+        
+        // Send to server using the ingest endpoint for documents
+        response = await axios.post('http://localhost:8000/ingest', formData, {
+          headers: {
+            'Content-Type': 'multipart/form-data'
+          }
+        });
+      }
+      
+      // Handle response from server
+      if (response.data.status === 'success') {
+        if (sourceType === 'llm') {
+          setMessage('✅ LLM Settings saved successfully! Your RAG system will use these settings for generating responses.');
+        } else {
+          // Calculate total document count
+          const documentCount = response.data.document_count || 0;
+          const chunkCount = response.data.chunk_count || 0;
+          const storageType = response.data.storage_type === 'google_drive' ? 'Google Drive' : 'local storage';
+          
+          setMessage(
+            `✅ Data ingestion successful! Processed ${documentCount} documents into ${chunkCount} chunks. ` +
+            `Vectorstore saved to ${storageType}.`
+          );
+        }
+      } else {
+        setError(`Error: ${response.data.detail || 'Unknown error occurred'}`);
       }
     } catch (err) {
-      setError(err.response?.data?.message || err.message || 'An error occurred');
+      console.error('Ingestion error:', err);
+      setError(`Error: ${err.response?.data?.detail || err.message || 'Unknown error occurred'}`);
     } finally {
       setIsLoading(false);
     }
@@ -335,420 +428,232 @@ const DataSourceConfig = () => {
     }
   };
 
-  return (
-    <div className="max-w-4xl mx-auto p-6">
-      <div className="bg-white p-6 rounded-lg shadow-sm border border-gray-200">
-      <h2 className="text-2xl font-bold mb-6">Data Source Configuration</h2>
-      
-        <div className="mb-6">
-          <div className="bg-gray-100 rounded-lg p-1 flex space-x-1">
-            <button
-              onClick={() => setSourceType('file')}
-              className={`flex-1 py-2 px-4 rounded-md text-sm font-medium ${
-                sourceType === 'file' ? 'bg-white shadow-sm' : 'hover:bg-gray-200'
-              }`}
-            >
-              <span className="flex items-center justify-center">
-                <i className="fas fa-file mr-2"></i> File Upload
-              </span>
-            </button>
-            
-            <button
-              onClick={() => setSourceType('mysql')}
-              className={`flex-1 py-2 px-4 rounded-md text-sm font-medium ${
-                sourceType === 'mysql' ? 'bg-white shadow-sm' : 'hover:bg-gray-200'
-              }`}
-            >
-              <span className="flex items-center justify-center">
-                <i className="fas fa-database mr-2"></i> Database
-              </span>
-            </button>
-            
-            <button
-              onClick={() => setSourceType('url')}
-              className={`flex-1 py-2 px-4 rounded-md text-sm font-medium ${
-                sourceType === 'url' ? 'bg-white shadow-sm' : 'hover:bg-gray-200'
-              }`}
-            >
-              <span className="flex items-center justify-center">
-                <i className="fas fa-globe mr-2"></i> Web URL
-              </span>
-            </button>
-            
-            <button
-              onClick={() => setSourceType('llm')}
-              className={`flex-1 py-2 px-4 rounded-md text-sm font-medium ${
-                sourceType === 'llm' ? 'bg-white shadow-sm' : 'hover:bg-gray-200'
-              }`}
-            >
-              <span className="flex items-center justify-center">
-                <i className="fas fa-robot mr-2"></i> LLM Config
-              </span>
-            </button>
-            
-            <button
-              onClick={() => setSourceType('google')}
-              className={`flex-1 py-2 px-4 rounded-md text-sm font-medium ${
-                sourceType === 'google' ? 'bg-white shadow-sm' : 'hover:bg-gray-200'
-              }`}
-            >
-              <span className="flex items-center justify-center">
-                <i className="fab fa-google mr-2"></i> Google
-              </span>
-            </button>
-          </div>
-          
-          <form onSubmit={handleSubmit}>
-            {/* File Upload Form */}
-            {sourceType === 'file' && (
-              <div className="mb-8">
-                <h3 className="font-medium mb-3">Upload Files (PDF, DOCX, TXT):</h3>
-                <div className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center">
-                  <input
-                    type="file"
-                    multiple
-                    accept=".pdf,.docx,.txt"
-                    onChange={handleFileChange}
-                    className="hidden"
-                    id="file-upload"
-                    required={sourceType === 'file'}
-                  />
-                  <label
-                    htmlFor="file-upload"
-                    className="cursor-pointer inline-flex justify-center items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
-                  >
-                    Choose files
-                  </label>
-                  <p className="text-sm text-gray-500 mt-2">Maximum 5 files</p>
-                  
-                  {files.length > 0 && (
-                    <div className="mt-4 text-left">
-                      <p className="font-medium">Selected files:</p>
-                      <ul className="list-disc pl-5 mt-2">
-                        {Array.from(files).map((file, index) => (
-                          <li key={index} className="text-sm text-gray-700">{file.name}</li>
-                        ))}
-                      </ul>
-                    </div>
+  const renderStorageOptions = () => (
+    <div className="mt-4 p-4 bg-white rounded-lg shadow-sm">
+      <h3 className="text-lg font-semibold mb-3">Storage Configuration</h3>
+      <div className="mb-3">
+        <label className="block text-sm font-medium text-gray-700 mb-1">
+          Where to store vectorstore:
+        </label>
+        <div className="grid gap-3">
+          {isLoadingStorageOptions ? (
+            <div className="text-gray-500">Loading storage options...</div>
+          ) : (
+            storageOptions.map(option => (
+              <div key={option.id} className="flex items-start">
+                <input
+                  type="radio"
+                  id={`storage-${option.id}`}
+                  name="storage-type"
+                  value={option.id}
+                  checked={storageConfig.type === option.id}
+                  onChange={handleStorageChange}
+                  disabled={!option.available}
+                  className="mt-1 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300"
+                />
+                <label htmlFor={`storage-${option.id}`} className="ml-2 block">
+                  <div className="font-medium text-gray-800">{option.name}</div>
+                  <div className="text-sm text-gray-500">{option.description}</div>
+                  {!option.available && (
+                    <div className="text-xs text-red-500 mt-1">{option.message || 'Not available'}</div>
                   )}
-          </div>
+                </label>
+              </div>
+            ))
+          )}
         </div>
-            )}
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="max-w-6xl mx-auto p-6">
+      <h1 className="text-2xl font-bold mb-6">Data Source Configuration</h1>
+      
+      <div className="bg-white p-6 rounded-lg shadow-md">
+        <div className="flex border-b mb-6">
+          <button
+            className={`px-4 py-2 border-b-2 ${sourceType === 'file' ? 'border-blue-500 text-blue-600' : 'border-transparent'}`}
+            onClick={() => setSourceType('file')}
+          >
+            File Upload
+          </button>
+          <button
+            className={`px-4 py-2 border-b-2 ${sourceType === 'mysql' ? 'border-blue-500 text-blue-600' : 'border-transparent'}`}
+            onClick={() => setSourceType('mysql')}
+          >
+            MySQL
+          </button>
+          <button
+            className={`px-4 py-2 border-b-2 ${sourceType === 'url' ? 'border-blue-500 text-blue-600' : 'border-transparent'}`}
+            onClick={() => setSourceType('url')}
+          >
+            URL
+          </button>
+          <button
+            className={`px-4 py-2 border-b-2 ${sourceType === 'google' ? 'border-blue-500 text-blue-600' : 'border-transparent'}`}
+            onClick={() => setSourceType('google')}
+          >
+            Google Services
+          </button>
+          <button
+            className={`px-4 py-2 border-b-2 ${sourceType === 'llm' ? 'border-blue-500 text-blue-600' : 'border-transparent'}`}
+            onClick={() => setSourceType('llm')}
+          >
+            LLM Settings
+          </button>
+        </div>
         
-        {/* MySQL Form */}
-        {sourceType === 'mysql' && (
-              <div className="mb-8">
-                <h3 className="font-medium mb-3">MySQL Connection:</h3>
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Host:</label>
+        <form onSubmit={handleSubmit}>
+          {/* Source-specific configuration */}
+          {sourceType === 'file' && (
+            <div>
+              <div className="mb-4">
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Upload Documents (PDF, DOCX, TXT)
+                </label>
                 <input
-                  type="text"
-                  name="host"
-                  value={mysqlConfig.host}
-                  onChange={handleMysqlChange}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                  required
+                  id="file-upload"
+                  type="file"
+                  multiple
+                  accept=".pdf,.docx,.txt"
+                  onChange={handleFileChange}
+                  className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
                 />
+                {files.length > 0 && (
+                  <div className="mt-2">
+                    <p className="text-sm text-gray-600">Selected {files.length} file(s):</p>
+                    <ul className="list-disc pl-5 mt-1 text-sm text-gray-600">
+                      {files.map((file, index) => (
+                        <li key={index}>{file.name} ({Math.round(file.size / 1024)} KB)</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </div>
-              <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Port:</label>
-                <input
-                  type="number"
-                  name="port"
-                  value={mysqlConfig.port}
-                  onChange={handleMysqlChange}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                  required
-                />
+              
+              {/* Add storage options */}
+              {renderStorageOptions()}
+            </div>
+          )}
+          
+          {sourceType === 'mysql' && (
+            <div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Host
+                  </label>
+                  <input
+                    type="text"
+                    name="host"
+                    value={mysqlConfig.host}
+                    onChange={handleMysqlChange}
+                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                    placeholder="localhost"
+                    required
+                  />
+                </div>
+                
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Port
+                  </label>
+                  <input
+                    type="number"
+                    name="port"
+                    value={mysqlConfig.port}
+                    onChange={handleMysqlChange}
+                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                    placeholder="3306"
+                    required
+                  />
+                </div>
               </div>
-              <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">User:</label>
-                <input
-                  type="text"
-                  name="user"
-                  value={mysqlConfig.user}
-                  onChange={handleMysqlChange}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                  required
-                />
+              
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Username
+                  </label>
+                  <input
+                    type="text"
+                    name="user"
+                    value={mysqlConfig.user}
+                    onChange={handleMysqlChange}
+                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                    placeholder="root"
+                    required
+                  />
+                </div>
+                
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Password
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showDbPassword ? "text" : "password"}
+                      name="password"
+                      value={mysqlConfig.password}
+                      onChange={handleMysqlChange}
+                      className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                      required
+                    />
+                    <button
+                      type="button"
+                      onClick={toggleDbPasswordVisibility}
+                      className="absolute inset-y-0 right-0 pr-3 flex items-center text-sm text-gray-500"
+                    >
+                      {showDbPassword ? "Hide" : "Show"}
+                    </button>
+                  </div>
+                </div>
               </div>
-              <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Password:</label>
-                    <div className="relative">
-                <input
-                        type={showDbPassword ? "text" : "password"}
-                  name="password"
-                  value={mysqlConfig.password}
-                  onChange={handleMysqlChange}
-                        className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                  required
-                />
-                      <button 
-                        type="button" 
-                        className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-500 cursor-pointer"
-                        onClick={toggleDbPasswordVisibility}
-                      >
-                        {showDbPassword ? (
-                          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7A9.97 9.97 0 014.02 8.971m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
-                          </svg>
-                        ) : (
-                          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                          </svg>
-                        )}
-                      </button>
-                    </div>
-              </div>
-              <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Database:</label>
+              
+              <div className="mb-4">
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Database
+                </label>
                 <input
                   type="text"
                   name="database"
                   value={mysqlConfig.database}
                   onChange={handleMysqlChange}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                  placeholder="mydatabase"
                   required
                 />
               </div>
+              
+              {/* Add storage options */}
+              {renderStorageOptions()}
             </div>
-
-                {/* Current Database Configuration */}
-                {latestConfig && latestConfig.mysql_config && (
-                  <div className="mt-6 p-4 bg-gray-50 rounded-md border border-gray-200">
-                    <h4 className="font-medium text-sm mb-2">Current Database Configuration:</h4>
-                    <pre className="text-xs bg-white p-3 rounded overflow-auto max-h-40">
-                      {JSON.stringify({
-                        host: latestConfig.mysql_config.host,
-                        port: latestConfig.mysql_config.port,
-                        user: latestConfig.mysql_config.user,
-                        database: latestConfig.mysql_config.database,
-                        // Don't show password
-                        password: "********"
-                      }, null, 2)}
-                    </pre>
-                </div>
-              )}
-          </div>
-        )}
-        
-        {/* URL Form */}
-        {sourceType === 'url' && (
-              <div className="mb-8">
-                <h3 className="font-medium mb-3">Web URL:</h3>
+          )}
+          
+          {sourceType === 'url' && (
             <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Enter URL:</label>
-              <input
-                type="url"
-                value={urlConfig.url}
-                onChange={handleUrlChange}
-                placeholder="https://example.com"
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                required={sourceType === 'url'}
-              />
-            </div>
-          </div>
-        )}
-        
-        {/* LLM Configuration */}
-            {sourceType === 'llm' && (
-              <div className="mb-8">
-                <h3 className="font-medium mb-3">LLM Configuration:</h3>
-          <div className="space-y-4">
-            <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">LLM Provider:</label>
-              <select
-                name="llm_provider"
-                value={llmConfig.llm_provider}
-                onChange={handleLlmChange}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-              >
-                <option value="local">Local Hosted (Free)</option>
-                <option value="hf_free">HuggingFace Free Tier (Rate-Limited)</option>
-                <option value="hf_paid">HuggingFace Paid API</option>
-                <option value="azure">Azure OpenAI Paid API</option>
-              </select>
-            </div>
-            
-            <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Model:</label>
-              <select
-                name="llm_model"
-                value={llmConfig.llm_model}
-                onChange={handleLlmChange}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-              >
-                {(llmConfig.llm_provider === 'local' || llmConfig.llm_provider.startsWith('hf_')) && (
-                  <>
-                    <option value="mistralai/Mixtral-8x7B-Instruct-v0.1">Mistralai/Mixtral-8x7B-Instruct-v0.1</option>
-                    <option value="tiiuae/falcon-7b-instruct">Tiiuae/Falcon-7B-Instruct</option>
-                    <option value="meta-llama/Meta-LLaMA-3-8B">Meta-LLaMA-3-8B</option>
-                          <option value="google/flan-t5-base">Google/Flan-T5-Base (Non-gated)</option>
-                          <option value="Xenova/distilbert-base-uncased">Xenova/DistilBERT (Embedded)</option>
-                    <option value="custom">Custom HuggingFace</option>
-                  </>
-                )}
-                
-                {llmConfig.llm_provider === 'azure' && (
-                  <>
-                    <option value="gpt-4o">GPT-4o</option>
-                    <option value="gpt-4o-mini">GPT-4o mini</option>
-                    <option value="gpt-4-turbo">GPT-4 Turbo</option>
-                    <option value="gpt-3.5-turbo">GPT-3.5-Turbo</option>
-                  </>
-                )}
-              </select>
-            </div>
-            
-            {llmConfig.llm_model === 'custom' && (
-              <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">Custom Model ID:</label>
-                <input
-                  type="text"
-                  name="llm_model"
-                  onChange={handleLlmChange}
-                  placeholder="e.g., google/flan-t5-xxl"
-                        className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                />
-              </div>
-            )}
-            
-            {llmConfig.llm_provider.startsWith('hf_') && (
-              <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">
-                  HuggingFace API Token:
-                  {llmConfig.llm_provider === 'hf_free' ? ' (Optional)' : ' (Required)'}
+              <div className="mb-4">
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Web URL
                 </label>
-                      <div className="relative">
                 <input
-                          type={showApiToken ? "text" : "password"}
-                  name="api_token"
-                  value={llmConfig.api_token}
-                  onChange={handleLlmChange}
-                          className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                  required={llmConfig.llm_provider === 'hf_paid'}
+                  type="url"
+                  value={urlConfig.url}
+                  onChange={handleUrlChange}
+                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                  placeholder="https://example.com/page-to-ingest"
+                  required
                 />
-                        <button 
-                          type="button" 
-                          className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-500 cursor-pointer"
-                          onClick={toggleApiTokenVisibility}
-                        >
-                          {showApiToken ? (
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7A9.97 9.97 0 014.02 8.971m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
-                            </svg>
-                          ) : (
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                            </svg>
-                          )}
-                        </button>
-                      </div>
               </div>
-            )}
-            
-            {llmConfig.llm_provider === 'azure' && (
-              <>
-                      <div className="mb-4">
-                        <label htmlFor="api_token" className="block text-sm font-medium text-gray-700 mb-1">
-                          Azure OpenAI API Key:
-                        </label>
-                        <div className="relative">
-                  <input
-                            type={showApiToken ? "text" : "password"}
-                            id="api_token"
-                    name="api_token"
-                    value={llmConfig.api_token}
-                    onChange={handleLlmChange}
-                            placeholder="Enter your Azure OpenAI API key"
-                            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border"
-                          />
-                          <button
-                            type="button"
-                            onClick={toggleApiTokenVisibility}
-                            className="absolute inset-y-0 right-0 pr-3 flex items-center"
-                          >
-                            <i className={`fas ${showApiToken ? 'fa-eye-slash' : 'fa-eye'} text-gray-400`}></i>
-                          </button>
-                        </div>
-                </div>
-                      <div className="mb-4">
-                        <label htmlFor="azure_endpoint" className="block text-sm font-medium text-gray-700 mb-1">
-                          Azure OpenAI Endpoint:
-                        </label>
-                  <input
-                    type="text"
-                          id="azure_endpoint"
-                    name="azure_endpoint"
-                    value={llmConfig.azure_endpoint}
-                    onChange={handleLlmChange}
-                          placeholder="https://your-resource-name.openai.azure.com/"
-                          className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border"
-                  />
-                </div>
-                      <div className="mb-4">
-                        <label htmlFor="azure_deployment" className="block text-sm font-medium text-gray-700 mb-1">
-                          Azure OpenAI Deployment Name:
-                        </label>
-                  <input
-                    type="text"
-                          id="azure_deployment"
-                    name="azure_deployment"
-                    value={llmConfig.azure_deployment}
-                    onChange={handleLlmChange}
-                          placeholder="Enter your deployment name (e.g. gpt4)"
-                          className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border"
-                        />
-                      </div>
-                      <div className="mb-4">
-                        <label htmlFor="api_version" className="block text-sm font-medium text-gray-700 mb-1">
-                          Azure OpenAI API Version:
-                        </label>
-                        <input
-                          type="text"
-                          id="api_version"
-                          name="api_version"
-                          value={llmConfig.api_version || "2023-05-15"}
-                          onChange={handleLlmChange}
-                          placeholder="2023-05-15"
-                          className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border"
-                        />
-                        <p className="mt-1 text-sm text-gray-500">
-                          Common values: 2023-05-15, 2023-12-01-preview, or 2024-02-15-preview
-                        </p>
-                      </div>
-                    </>
-                  )}
-                  
-                  <p className="text-sm text-gray-600 mt-2">
-                    Note: Local Hosted is free; HuggingFace Free Tier is rate-limited; Paid options require subscription.
-                  </p>
-
-                  {/* Current LLM Configuration */}
-                  {latestConfig && latestConfig.llm_config && (
-                    <div className="mt-4 p-4 bg-gray-50 rounded-md border border-gray-200">
-                      <h4 className="font-medium text-sm mb-2">Current LLM Configuration:</h4>
-                      <pre className="text-xs bg-white p-3 rounded overflow-auto max-h-40">
-                        {JSON.stringify({
-                          llm_provider: latestConfig.llm_config.llm_provider,
-                          llm_model: latestConfig.llm_config.llm_model,
-                          api_token: latestConfig.llm_config.api_token ? "••••••••••••••••" : "",
-                          azure_endpoint: latestConfig.llm_config.azure_endpoint,
-                          azure_deployment: latestConfig.llm_config.azure_deployment,
-                          api_version: latestConfig.llm_config.api_version
-                        }, null, 2)}
-                      </pre>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-            
-            {/* Google Form */}
-            {sourceType === 'google' && (
+              
+              {/* Add storage options */}
+              {renderStorageOptions()}
+            </div>
+          )}
+          
+          {sourceType === 'google' && (
+            <div>
               <div className="mb-8">
                 <h3 className="font-medium mb-3">Google Services Configuration:</h3>
                 
@@ -849,17 +754,17 @@ const DataSourceConfig = () => {
                         <input
                           type="checkbox"
                           id="drive"
-                          checked={googleConfig.services.includes('drive')}
+                          checked={googleConfig.services?.includes('drive')}
                           onChange={(e) => {
                             if (e.target.checked) {
                               setGoogleConfig({
                                 ...googleConfig,
-                                services: [...googleConfig.services, 'drive']
+                                services: [...(googleConfig.services || []), 'drive']
                               });
                             } else {
                               setGoogleConfig({
                                 ...googleConfig,
-                                services: googleConfig.services.filter(s => s !== 'drive')
+                                services: (googleConfig.services || []).filter(s => s !== 'drive')
                               });
                             }
                           }}
@@ -875,17 +780,17 @@ const DataSourceConfig = () => {
                         <input
                           type="checkbox"
                           id="gmail"
-                          checked={googleConfig.services.includes('gmail')}
+                          checked={googleConfig.services?.includes('gmail')}
                           onChange={(e) => {
                             if (e.target.checked) {
                               setGoogleConfig({
                                 ...googleConfig,
-                                services: [...googleConfig.services, 'gmail']
+                                services: [...(googleConfig.services || []), 'gmail']
                               });
                             } else {
                               setGoogleConfig({
                                 ...googleConfig,
-                                services: googleConfig.services.filter(s => s !== 'gmail')
+                                services: (googleConfig.services || []).filter(s => s !== 'gmail')
                               });
                             }
                           }}
@@ -901,17 +806,17 @@ const DataSourceConfig = () => {
                         <input
                           type="checkbox"
                           id="photos"
-                          checked={googleConfig.services.includes('photos')}
+                          checked={googleConfig.services?.includes('photos')}
                           onChange={(e) => {
                             if (e.target.checked) {
                               setGoogleConfig({
                                 ...googleConfig,
-                                services: [...googleConfig.services, 'photos']
+                                services: [...(googleConfig.services || []), 'photos']
                               });
                             } else {
                               setGoogleConfig({
                                 ...googleConfig,
-                                services: googleConfig.services.filter(s => s !== 'photos')
+                                services: (googleConfig.services || []).filter(s => s !== 'photos')
                               });
                             }
                           }}
@@ -948,76 +853,180 @@ const DataSourceConfig = () => {
                     />
                     <p className="text-xs text-gray-500 mt-1">
                       Limits how many items to fetch from each selected service
-            </p>
-          </div>
-        </div>
+                    </p>
+                  </div>
+                </div>
               </div>
-            )}
-        
-        {/* Submit Button */}
-            <div className="mt-8 flex justify-center space-x-4">
-          <button
-            type="submit"
-            disabled={isLoading}
-                className="px-6 py-3 bg-blue-600 text-black font-medium rounded-md shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50"
-          >
-            {isLoading ? (
-                  <span className="flex items-center">
-                    <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-black" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                    </svg>
-                    Processing...
-                  </span>
-                ) : 'Save Configuration'}
-              </button>
-
-              {sourceType === 'google' && (
+              
+              {googleAuthStatus && googleAuthStatus.is_authenticated && renderStorageOptions()}
+            </div>
+          )}
+          
+          {sourceType === 'llm' && (
+            <div>
+              <div className="mb-4">
+                <h3 className="text-lg font-semibold mb-4">LLM Provider Configuration</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      LLM Provider
+                    </label>
+                    <select
+                      name="llm_provider"
+                      value={llmConfig.llm_provider}
+                      onChange={handleLlmChange}
+                      className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                    >
+                      <option value="local">Local (GGUF)</option>
+                      <option value="openai">OpenAI</option>
+                      <option value="anthropic">Anthropic</option>
+                      <option value="azure">Azure</option>
+                      <option value="huggingface">HuggingFace</option>
+                    </select>
+                  </div>
+                  
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Model Name
+                    </label>
+                    <input
+                      type="text"
+                      name="llm_model"
+                      value={llmConfig.llm_model}
+                      onChange={handleLlmChange}
+                      placeholder={llmConfig.llm_provider === 'local' ? 'mistralai/Mixtral-8x7B-Instruct-v0.1' : 
+                                  llmConfig.llm_provider === 'openai' ? 'gpt-4' : 
+                                  llmConfig.llm_provider === 'anthropic' ? 'claude-3-opus-20240229' :
+                                  llmConfig.llm_provider === 'azure' ? llmConfig.azure_deployment || 'deployment-name' :
+                                  'model-name'}
+                      className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                    />
+                  </div>
+                </div>
+                
+                {(llmConfig.llm_provider === 'openai' || llmConfig.llm_provider === 'anthropic' || llmConfig.llm_provider === 'huggingface') && (
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      API Key
+                    </label>
+                    <div className="relative">
+                      <input
+                        type={showApiToken ? "text" : "password"}
+                        name="api_token"
+                        value={llmConfig.api_token}
+                        onChange={handleLlmChange}
+                        placeholder="Enter your API key"
+                        className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                      />
+                      <button
+                        type="button"
+                        onClick={toggleApiTokenVisibility}
+                        className="absolute inset-y-0 right-0 pr-3 flex items-center text-sm text-gray-500"
+                      >
+                        {showApiToken ? "Hide" : "Show"}
+                      </button>
+                    </div>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Your API key will be stored on your server and not shared.
+                    </p>
+                  </div>
+                )}
+                
+                {llmConfig.llm_provider === 'azure' && (
+                  <div className="space-y-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Azure Endpoint
+                      </label>
+                      <input
+                        type="text"
+                        name="azure_endpoint"
+                        value={llmConfig.azure_endpoint}
+                        onChange={handleLlmChange}
+                        placeholder="https://your-resource-name.openai.azure.com"
+                        className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                      />
+                    </div>
+                    
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Azure Deployment Name
+                      </label>
+                      <input
+                        type="text"
+                        name="azure_deployment"
+                        value={llmConfig.azure_deployment}
+                        onChange={handleLlmChange}
+                        placeholder="your-deployment-name"
+                        className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                      />
+                    </div>
+                    
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        API Version
+                      </label>
+                      <input
+                        type="text"
+                        name="api_version"
+                        value={llmConfig.api_version}
+                        onChange={handleLlmChange}
+                        placeholder="2023-12-01-preview"
+                        className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                      />
+                    </div>
+                    
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        API Key
+                      </label>
+                      <div className="relative">
+                        <input
+                          type={showApiToken ? "text" : "password"}
+                          name="api_token"
+                          value={llmConfig.api_token}
+                          onChange={handleLlmChange}
+                          placeholder="Enter your Azure API key"
+                          className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                        />
+                        <button
+                          type="button"
+                          onClick={toggleApiTokenVisibility}
+                          className="absolute inset-y-0 right-0 pr-3 flex items-center text-sm text-gray-500"
+                        >
+                          {showApiToken ? "Hide" : "Show"}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+              
+              <div className="mt-6">
                 <button
-                  type="button"
-                  onClick={ingestGoogleData}
-                  disabled={!googleAuthStatus || !googleAuthStatus.is_authenticated || !latestConfig || isIngestingGoogle || googleConfig.services.length === 0}
-                  className={`px-6 py-3 font-medium rounded-md shadow-sm text-black ${
-                    !googleAuthStatus || !googleAuthStatus.is_authenticated || !latestConfig || googleConfig.services.length === 0
-                      ? 'bg-gray-300 cursor-not-allowed'
-                      : isIngestingGoogle
-                      ? 'bg-blue-400 cursor-wait'
-                      : 'bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500'
-                  }`}
+                  type="submit"
+                  disabled={isLoading}
+                  className="inline-flex justify-center py-2 px-4 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-black bg-white hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-500 disabled:opacity-50"
                 >
-                  {isIngestingGoogle ? (
-                    <span className="flex items-center">
-                      <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-black" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                      Ingesting...
-              </span>
-                  ) : 'Ingest Google Data'}
-          </button>
-              )}
-        </div>
-        
-        {/* Status Messages */}
-        {message && (
-              <div className="mt-4 p-3 bg-green-100 text-green-700 rounded-md flex items-center">
-                <svg className="h-5 w-5 mr-2" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
-                </svg>
-            {message}
-          </div>
-        )}
-        
-        {error && (
-              <div className="mt-4 p-3 bg-red-100 text-red-700 rounded-md flex items-center">
-                <svg className="h-5 w-5 mr-2" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
-                </svg>
-            Error: {error}
-          </div>
-        )}
-      </form>
-        </div>
+                  {isLoading ? 'Saving...' : 'Save LLM Settings'}
+                </button>
+              </div>
+            </div>
+          )}
+          
+          {/* Always show submit button unless in LLM settings */}
+          {sourceType !== 'llm' && (
+            <div className="mt-6">
+              <button
+                type="submit"
+                disabled={isLoading}
+                className="inline-flex justify-center py-2 px-4 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-black bg-white hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-500 disabled:opacity-50"
+              >
+                {isLoading ? 'Processing...' : 'Ingest Data'}
+              </button>
+            </div>
+          )}
+        </form>
       </div>
     </div>
   );

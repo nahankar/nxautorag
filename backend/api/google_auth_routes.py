@@ -129,10 +129,10 @@ async def oauth_callback(code: str, state: str, response: Response):
         )
         
         # Redirect back to the frontend app - update the URL to match what the frontend expects
-        return RedirectResponse(url="http://localhost:3000?auth=success")
+        return RedirectResponse(url="http://localhost:5173?auth=success")
     
     except Exception as e:
-        return RedirectResponse(url=f"http://localhost:3000?auth=error&message={str(e)}")
+        return RedirectResponse(url=f"http://localhost:5173?auth=error&message={str(e)}")
 
 @router.get("/auth-status")
 async def auth_status():

@@ -14,7 +14,7 @@ load_dotenv()
 
 # Define scopes needed for different Google services
 SCOPES = [
-    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/drive',
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/photoslibrary.readonly'
 ]
@@ -167,11 +167,45 @@ def list_drive_files(creds, max_files=50):
     """List files from Google Drive."""
     try:
         service = get_drive_service(creds)
+        
+        # First get all files at the root level
         results = service.files().list(
             pageSize=max_files,
             fields="nextPageToken, files(id, name, mimeType, description)"
         ).execute()
-        return results.get('files', []), None
+        
+        files = results.get('files', [])
+        
+        # Identify folders
+        folders = [file for file in files if file.get('mimeType') == 'application/vnd.google-apps.folder']
+        
+        # Recursively search inside each folder
+        for folder in folders:
+            folder_id = folder.get('id')
+            folder_name = folder.get('name')
+            print(f"Searching inside folder: {folder_name}")
+            
+            # Get files inside this folder
+            folder_results = service.files().list(
+                pageSize=max_files,
+                q=f"'{folder_id}' in parents",
+                fields="files(id, name, mimeType, description)"
+            ).execute()
+            
+            folder_files = folder_results.get('files', [])
+            
+            # Add folder path to file names for clarity
+            for file in folder_files:
+                file['name'] = f"{folder_name}/{file['name']}"
+            
+            # Add these files to our results
+            files.extend(folder_files)
+            
+            # Limit to max_files to avoid excessive recursion
+            if len(files) >= max_files:
+                break
+                
+        return files, None
     except Exception as e:
         return None, str(e)
 
